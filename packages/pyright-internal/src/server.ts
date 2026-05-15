@@ -279,10 +279,46 @@ export class PyrightServer extends LanguageServerBase {
         // clients that do not support work done progress.
         let displayingProgress = false;
         let workDoneProgress: Promise<WorkDoneProgressServerReporter> | undefined;
+
+        // Debounce delay in ms. Rapid analysis cycles (e.g. one per keystroke) will
+        // reuse the same WorkDoneProgress token instead of opening a new one for every
+        // cycle, preventing clients such as Neovim from flooding the UI with completed
+        // lsp.progress notifications.
+        const endDebounceMs = 500;
+        let endDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+        const doEnd = () => {
+            endDebounceTimer = undefined;
+            displayingProgress = false;
+            if (workDoneProgress) {
+                workDoneProgress
+                    .then((progress) => {
+                        progress.done();
+                    })
+                    .catch(() => {});
+                workDoneProgress = undefined;
+            } else {
+                this.connection.sendNotification('pyright/endProgress');
+            }
+        };
+
         return {
             isDisplayingProgress: () => displayingProgress,
             isEnabled: (data: AnalysisResults) => true,
             begin: () => {
+                // If an end is pending in the debounce window, cancel it so we reuse
+                // the existing WorkDoneProgress token rather than starting a new one.
+                if (endDebounceTimer !== undefined) {
+                    clearTimeout(endDebounceTimer);
+                    endDebounceTimer = undefined;
+                    // displayingProgress is still true; nothing else to do.
+                    return;
+                }
+
+                if (displayingProgress) {
+                    return;
+                }
+
                 displayingProgress = true;
                 if (this.client.hasWindowProgressCapability) {
                     workDoneProgress = this.connection.window.createWorkDoneProgress();
@@ -307,17 +343,14 @@ export class PyrightServer extends LanguageServerBase {
                 }
             },
             end: () => {
-                displayingProgress = false;
-                if (workDoneProgress) {
-                    workDoneProgress
-                        .then((progress) => {
-                            progress.done();
-                        })
-                        .catch(() => {});
-                    workDoneProgress = undefined;
-                } else {
-                    this.connection.sendNotification('pyright/endProgress');
+                if (!displayingProgress && endDebounceTimer === undefined) {
+                    return;
                 }
+                // Defer the actual end to allow a rapid follow-up begin() to cancel it.
+                if (endDebounceTimer !== undefined) {
+                    clearTimeout(endDebounceTimer);
+                }
+                endDebounceTimer = setTimeout(doEnd, endDebounceMs);
             },
         };
     }
